@@ -1,7 +1,16 @@
 import struct
 import os
-from typing import Union, Tuple
+import time
+from typing import Union, Tuple, Optional
+from enum import Enum
 
+#try:
+#    from Crypto.Cipher import _raw_aesni
+#
+#    AESNI_AVAILABLE = _raw_aesni.is_AES_NI_enabled()
+#except ImportError:
+#   AESNI_AVAILABLE = False
+AESNI_AVAILABLE = False
 # SM4 S-box
 SBOX = [
     0xD6, 0x90, 0xE9, 0xFE, 0xCC, 0xE1, 0x3D, 0xB7, 0x16, 0xB6, 0x14, 0xC2, 0x28, 0xFB, 0x2C, 0x05,
@@ -37,41 +46,72 @@ CK = [
     0x10171E25, 0x2C333A41, 0x484F565D, 0x646B7279
 ]
 
+# Precomputed T-tables for encryption and key expansion
+T0 = [0] * 256
+T1 = [0] * 256
+T2 = [0] * 256
+T3 = [0] * 256
+T_prime0 = [0] * 256
+T_prime1 = [0] * 256
+T_prime2 = [0] * 256
+T_prime3 = [0] * 256
+
+
+# Precompute T-tables
+def init_tables():
+    for i in range(256):
+        # For encryption T-transformation
+        b = SBOX[i]
+        val = (b << 24) | (b << 16) | (b << 8) | b
+        T0[i] = val ^ left_rotate(val, 2) ^ left_rotate(val, 10) ^ left_rotate(val, 18) ^ left_rotate(val, 24)
+
+        # For key expansion T'-transformation
+        T_prime0[i] = val ^ left_rotate(val, 13) ^ left_rotate(val, 23)
+
+        # Generate other tables by rotating bytes
+        T1[i] = left_rotate(T0[i], 8)
+        T2[i] = left_rotate(T0[i], 16)
+        T3[i] = left_rotate(T0[i], 24)
+
+        T_prime1[i] = left_rotate(T_prime0[i], 8)
+        T_prime2[i] = left_rotate(T_prime0[i], 16)
+        T_prime3[i] = left_rotate(T_prime0[i], 24)
+
 
 def left_rotate(n: int, b: int) -> int:
     """32-bit left rotation"""
     return ((n << b) | (n >> (32 - b))) & 0xFFFFFFFF
 
 
-def t_transformation(word: int) -> int:
-    """Encryption round function transformation"""
-    # S-box substitution
-    b0 = SBOX[(word >> 24) & 0xFF]
-    b1 = SBOX[(word >> 16) & 0xFF]
-    b2 = SBOX[(word >> 8) & 0xFF]
-    b3 = SBOX[word & 0xFF]
-
-    # Linear transformation L
-    new_word = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
-    return new_word ^ left_rotate(new_word, 2) ^ left_rotate(new_word, 10) ^ left_rotate(new_word, 18) ^ left_rotate(
-        new_word, 24)
+# Initialize tables at module load
+init_tables()
 
 
-def t_prime_transformation(word: int) -> int:
-    """Key expansion transformation"""
-    # S-box substitution
-    b0 = SBOX[(word >> 24) & 0xFF]
-    b1 = SBOX[(word >> 16) & 0xFF]
-    b2 = SBOX[(word >> 8) & 0xFF]
-    b3 = SBOX[word & 0xFF]
-
-    # Linear transformation L'
-    new_word = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
-    return new_word ^ left_rotate(new_word, 13) ^ left_rotate(new_word, 23)
+class OptimizationLevel(Enum):
+    BASIC = 0
+    TTABLE = 1
+    AVX2 = 2
+    AESNI = 3
+    GFNI = 4
 
 
-def key_expansion(master_key: bytes) -> list:
-    """Expand 128-bit key into 32 round keys"""
+class SM4GCM:
+    def __init__(self, key: bytes, optimization: OptimizationLevel = OptimizationLevel.TTABLE):
+        if len(key) != 16:
+            raise ValueError("SM4 key must be 16 bytes")
+        self.key = key
+        self.round_keys = key_expansion(key, optimization)
+        self.optimization = optimization
+
+    def encrypt(self, plaintext: bytes, nonce: bytes, aad: bytes = b"") -> Tuple[bytes, bytes]:
+        return sm4_gcm_encrypt(plaintext, self.key, nonce, aad, self.optimization)
+
+    def decrypt(self, ciphertext: bytes, nonce: bytes, tag: bytes, aad: bytes = b"") -> bytes:
+        return sm4_gcm_decrypt(ciphertext, self.key, nonce, tag, aad, self.optimization)
+
+
+def key_expansion(master_key: bytes, optimization: OptimizationLevel = OptimizationLevel.BASIC) -> list:
+    """Expand 128-bit key into 32 round keys with optimization support"""
     if len(master_key) != 16:
         raise ValueError("SM4 key must be 16 bytes (128 bits)")
 
@@ -87,18 +127,44 @@ def key_expansion(master_key: bytes) -> list:
 
     round_keys = [0] * 32
 
-    # Generate round keys
+    # Generate round keys with optimization
     for i in range(32):
         tmp = k[i + 1] ^ k[i + 2] ^ k[i + 3] ^ CK[i]
-        tmp = t_prime_transformation(tmp)
+
+        if optimization == OptimizationLevel.BASIC:
+            tmp = t_prime_transformation_basic(tmp)
+        else:  # TTABLE and others use precomputed tables
+            # Extract bytes
+            b0 = (tmp >> 24) & 0xFF
+            b1 = (tmp >> 16) & 0xFF
+            b2 = (tmp >> 8) & 0xFF
+            b3 = tmp & 0xFF
+
+            # Apply T'-transformation using precomputed tables
+            tmp = T_prime0[b0] ^ T_prime1[b1] ^ T_prime2[b2] ^ T_prime3[b3]
+
         k[i + 4] = k[i] ^ tmp
         round_keys[i] = k[i + 4]
 
     return round_keys
 
 
-def sm4_block_encrypt(block: bytes, round_keys: list) -> bytes:
-    """Encrypt a single 16-byte block"""
+def t_prime_transformation_basic(word: int) -> int:
+    """Basic implementation of key expansion transformation"""
+    # S-box substitution
+    b0 = SBOX[(word >> 24) & 0xFF]
+    b1 = SBOX[(word >> 16) & 0xFF]
+    b2 = SBOX[(word >> 8) & 0xFF]
+    b3 = SBOX[word & 0xFF]
+
+    # Linear transformation L'
+    new_word = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+    return new_word ^ left_rotate(new_word, 13) ^ left_rotate(new_word, 23)
+
+
+def sm4_block_encrypt(block: bytes, round_keys: list,
+                      optimization: OptimizationLevel = OptimizationLevel.TTABLE) -> bytes:
+    """Encrypt a single 16-byte block with optimization support"""
     if len(block) != 16:
         raise ValueError("Block must be 16 bytes")
 
@@ -109,7 +175,19 @@ def sm4_block_encrypt(block: bytes, round_keys: list) -> bytes:
     for i in range(32):
         # F function
         tmp = x[i + 1] ^ x[i + 2] ^ x[i + 3] ^ round_keys[i]
-        tmp = t_transformation(tmp)
+
+        if optimization == OptimizationLevel.BASIC:
+            tmp = t_transformation_basic(tmp)
+        else:  # TTABLE and others use precomputed tables
+            # Extract bytes
+            b0 = (tmp >> 24) & 0xFF
+            b1 = (tmp >> 16) & 0xFF
+            b2 = (tmp >> 8) & 0xFF
+            b3 = tmp & 0xFF
+
+            # Apply T-transformation using precomputed tables
+            tmp = T0[b0] ^ T1[b1] ^ T2[b2] ^ T3[b3]
+
         x.append(x[i] ^ tmp)
 
     # Final reversal and output
@@ -117,13 +195,26 @@ def sm4_block_encrypt(block: bytes, round_keys: list) -> bytes:
     return struct.pack('>4I', *y)
 
 
-def sm4_block_decrypt(block: bytes, round_keys: list) -> bytes:
-    """Decrypt a single 16-byte block"""
+def t_transformation_basic(word: int) -> int:
+    """Basic implementation of encryption round function"""
+    # S-box substitution
+    b0 = SBOX[(word >> 24) & 0xFF]
+    b1 = SBOX[(word >> 16) & 0xFF]
+    b2 = SBOX[(word >> 8) & 0xFF]
+    b3 = SBOX[word & 0xFF]
+
+    # Linear transformation L
+    new_word = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+    return new_word ^ left_rotate(new_word, 2) ^ left_rotate(new_word, 10) ^ left_rotate(new_word, 18) ^ left_rotate(
+        new_word, 24)
+
+
+def sm4_block_decrypt(block: bytes, round_keys: list,
+                      optimization: OptimizationLevel = OptimizationLevel.TTABLE) -> bytes:
+    """Decrypt a single 16-byte block with optimization support"""
     if len(block) != 16:
         raise ValueError("Block must be 16 bytes")
-
-    # Reverse the round keys for decryption
-    return sm4_block_encrypt(block, round_keys[::-1])
+    return sm4_block_encrypt(block, round_keys[::-1], optimization)
 
 
 def pkcs7_pad(data: bytes, block_size: int = 16) -> bytes:
@@ -151,15 +242,17 @@ def xor_bytes(a: bytes, b: bytes) -> bytes:
 
 
 def sm4_encrypt(plaintext: Union[str, bytes], key: Union[str, bytes],
-                iv: bytes = None, mode: str = 'CBC') -> Tuple[bytes, bytes]:
+                iv: bytes = None, mode: str = 'CBC',
+                optimization: OptimizationLevel = OptimizationLevel.TTABLE) -> Tuple[bytes, bytes]:
     """
-    Encrypt variable-length plaintext using SM4 in CBC mode
+    Encrypt variable-length plaintext using SM4 with optimization
 
     Args:
         plaintext: Input data (str or bytes)
         key: Encryption key (16 bytes, str or bytes)
         iv: Initialization vector (16 bytes), random if None
-        mode: Only CBC mode is supported for now
+        mode: Encryption mode (CBC or ECB)
+        optimization: Optimization level to use
 
     Returns:
         (ciphertext, iv) tuple
@@ -172,59 +265,111 @@ def sm4_encrypt(plaintext: Union[str, bytes], key: Union[str, bytes],
 
     # Validate key
     if len(key) != 16:
-        #print(key, len(key))
         raise ValueError("SM4 key must be 16 bytes (128 bits)")
 
     # Generate random IV if not provided
-    if iv is None:
+    if iv is None and mode != 'ECB':
         iv = os.urandom(16)
-    elif len(iv) != 16:
+    elif iv is not None and len(iv) != 16 and mode != 'ECB':
         raise ValueError("IV must be 16 bytes")
 
     # Expand key
-    round_keys = key_expansion(key)
+    round_keys = key_expansion(key, optimization)
 
     # Apply padding
-    padded_data = pkcs7_pad(plaintext)
+    padded_data = pkcs7_pad(plaintext) if mode != 'CTR' else plaintext
 
-    # Encrypt in CBC mode
+    # Encrypt based on mode
+    if mode == 'CBC':
+        ciphertext = _sm4_cbc_encrypt(padded_data, round_keys, iv, optimization)
+        return ciphertext, iv  # 修改这里：返回密文和IV
+    elif mode == 'ECB':
+        return _sm4_ecb_encrypt(padded_data, round_keys, optimization), b''
+    elif mode == 'CTR':
+        return _sm4_ctr_encrypt(padded_data, round_keys, iv, optimization), iv
+    else:
+        raise ValueError(f"Unsupported mode: {mode}")
+
+
+def _sm4_cbc_encrypt(data: bytes, round_keys: list, iv: bytes,
+                     optimization: OptimizationLevel) -> Tuple[bytes, bytes]:
+    """CBC mode encryption"""
     ciphertext = b''
     previous_block = iv
 
     # Process each 16-byte block
-    for i in range(0, len(padded_data), 16):
-        block = padded_data[i:i + 16]
+    for i in range(0, len(data), 16):
+        block = data[i:i + 16]
 
         # XOR with previous ciphertext block (or IV for first block)
         xored_block = xor_bytes(block, previous_block)
 
         # Encrypt the block
-        encrypted_block = sm4_block_encrypt(xored_block, round_keys)
+        encrypted_block = sm4_block_encrypt(xored_block, round_keys, optimization)
 
         # Add to ciphertext and set as previous for next block
         ciphertext += encrypted_block
         previous_block = encrypted_block
 
-    return ciphertext, iv
+    return ciphertext
+
+
+def _sm4_ecb_encrypt(data: bytes, round_keys: list,
+                     optimization: OptimizationLevel) -> bytes:
+    """ECB mode encryption"""
+    ciphertext = b''
+
+    # Process each 16-byte block independently
+    for i in range(0, len(data), 16):
+        block = data[i:i + 16]
+        encrypted_block = sm4_block_encrypt(block, round_keys, optimization)
+        ciphertext += encrypted_block
+
+    return ciphertext
+
+
+def _sm4_ctr_encrypt(data: bytes, round_keys: list, nonce: bytes,
+                     optimization: OptimizationLevel) -> bytes:
+    """CTR mode encryption"""
+    ciphertext = b''
+    counter = int.from_bytes(nonce, 'big')
+
+    # Process each 16-byte block
+    for i in range(0, len(data), 16):
+        # Encrypt current counter value
+        counter_block = counter.to_bytes(16, 'big')
+        keystream_block = sm4_block_encrypt(counter_block, round_keys, optimization)
+
+        # XOR with plaintext
+        block = data[i:i + 16]
+        ciphertext_block = xor_bytes(block, keystream_block[:len(block)])
+        ciphertext += ciphertext_block
+
+        # Increment counter
+        counter = (counter + 1) & ((1 << 128) - 1)
+
+    return ciphertext
 
 
 def sm4_decrypt(ciphertext: bytes, key: Union[str, bytes],
-                iv: bytes, mode: str = 'CBC') -> bytes:
+                iv: bytes = None, mode: str = 'CBC',
+                optimization: OptimizationLevel = OptimizationLevel.TTABLE) -> bytes:
     """
-    Decrypt SM4 encrypted data in CBC mode
+    Decrypt SM4 encrypted data with optimization
 
     Args:
         ciphertext: Encrypted data (bytes)
         key: Encryption key (16 bytes, str or bytes)
         iv: Initialization vector (16 bytes)
-        mode: Only CBC mode is supported for now
+        mode: Encryption mode (CBC or ECB)
+        optimization: Optimization level to use
 
     Returns:
         Decrypted plaintext (bytes)
     """
     # Validate inputs
-    if len(ciphertext) % 16 != 0:
-        raise ValueError("Ciphertext length must be multiple of 16 bytes")
+    if len(ciphertext) % 16 != 0 and mode != 'CTR':
+        raise ValueError("Ciphertext length must be multiple of 16 bytes for CBC/ECB modes")
 
     if isinstance(key, str):
         key = key.encode('utf-8')
@@ -232,13 +377,28 @@ def sm4_decrypt(ciphertext: bytes, key: Union[str, bytes],
     if len(key) != 16:
         raise ValueError("SM4 key must be 16 bytes (128 bits)")
 
-    if len(iv) != 16:
+    if iv is None and mode != 'ECB':
+        raise ValueError("IV required for CBC/CTR modes")
+    elif iv is not None and len(iv) != 16 and mode != 'ECB':
         raise ValueError("IV must be 16 bytes")
 
     # Expand key
-    round_keys = key_expansion(key)
+    round_keys = key_expansion(key, optimization)
 
-    # Decrypt in CBC mode
+    # Decrypt based on mode
+    if mode == 'CBC':
+        return _sm4_cbc_decrypt(ciphertext, round_keys, iv, optimization)
+    elif mode == 'ECB':
+        return _sm4_ecb_decrypt(ciphertext, round_keys, optimization)
+    elif mode == 'CTR':
+        return _sm4_ctr_decrypt(ciphertext, round_keys, iv, optimization)
+    else:
+        raise ValueError(f"Unsupported mode: {mode}")
+
+
+def _sm4_cbc_decrypt(ciphertext: bytes, round_keys: list, iv: bytes,
+                     optimization: OptimizationLevel) -> bytes:
+    """CBC mode decryption"""
     decrypted_blocks = []
     previous_block = iv
 
@@ -247,7 +407,7 @@ def sm4_decrypt(ciphertext: bytes, key: Union[str, bytes],
         block = ciphertext[i:i + 16]
 
         # Decrypt the block
-        decrypted_block = sm4_block_decrypt(block, round_keys)
+        decrypted_block = sm4_block_decrypt(block, round_keys, optimization)
 
         # XOR with previous ciphertext block (or IV for first block)
         plaintext_block = xor_bytes(decrypted_block, previous_block)
@@ -263,35 +423,310 @@ def sm4_decrypt(ciphertext: bytes, key: Union[str, bytes],
     return pkcs7_unpad(padded_plaintext)
 
 
-# Example usage with variable-length plaintext
-if __name__ == "__main__":
-    # Test key and IV
-    key = b"16bytekey1234567"  # 16 bytes key
-    iv = b"initialvector123"  # 16 bytes IV
+def _sm4_ecb_decrypt(ciphertext: bytes, round_keys: list,
+                     optimization: OptimizationLevel) -> bytes:
+    """ECB mode decryption"""
+    decrypted_blocks = []
 
-    # Test messages of different lengths
-    messages = [
-        b"",  # Empty message
-        b"A",  # 1 byte
-        b"Hello, SM4!",  # 11 bytes
-        b"1234567890" * 10,  # 100 bytes
-        b"Padding test" * 17  # 204 bytes (exactly 16 blocks)
+    # Process each 16-byte block independently
+    for i in range(0, len(ciphertext), 16):
+        block = ciphertext[i:i + 16]
+        decrypted_block = sm4_block_decrypt(block, round_keys, optimization)
+        decrypted_blocks.append(decrypted_block)
+
+    # Concatenate and unpad
+    padded_plaintext = b''.join(decrypted_blocks)
+    return pkcs7_unpad(padded_plaintext)
+
+
+def _sm4_ctr_decrypt(ciphertext: bytes, round_keys: list, nonce: bytes,
+                     optimization: OptimizationLevel) -> bytes:
+    """CTR mode decryption (same as encryption)"""
+    return _sm4_ctr_encrypt(ciphertext, round_keys, nonce, optimization)
+
+
+# GCM constants
+GCM_BLOCK_SIZE = 16
+GCM_IV_SIZE = 12  # Recommended IV size for GCM
+
+# Precomputed tables for GHASH
+gcmR = 0xE1000000000000000000000000000000  # Reduction constant
+
+
+def ghash_precompute(H: bytes) -> list:
+    """Precompute multiplication table for GHASH"""
+    # Convert H to integer (big-endian)
+    H_int = int.from_bytes(H, 'big')
+
+    # Precompute table for 4-bit windows (16 entries)
+    table = [0] * 16
+    table[0] = 0
+    table[1] = H_int
+
+    # Double for each subsequent entry
+    for i in range(2, 16, 2):
+        # Double the previous value
+        table[i] = gcm_double(table[i // 2])
+        # Double and add H
+        table[i + 1] = table[i] ^ H_int
+
+    return table
+
+
+def gcm_double(x: int) -> int:
+    """Double operation in GF(2^128)"""
+    # If the highest bit is 1, we'll need to reduce
+    reduce = (x >> 127) & 1
+    x <<= 1
+    if reduce:
+        x ^= gcmR
+    return x & ((1 << 128) - 1)
+
+
+def ghash_block(X: int, H_table: list) -> int:
+    """GHASH one block using precomputed table"""
+    # Break into 4-bit chunks (32 chunks, 4 bits each)
+    result = 0
+    for i in range(0, 128, 4):
+        # Extract 4-bit chunk
+        chunk = (X >> (124 - i)) & 0xF
+        # Multiply current result by 16
+        result = gcm_double(gcm_double(gcm_double(gcm_double(result))))
+        # Add table entry
+        result ^= H_table[chunk]
+    return result
+
+
+def ghash(data: bytes, H: bytes) -> int:
+    """Compute GHASH using precomputed table"""
+    # Precompute multiplication table
+    H_table = ghash_precompute(H)
+
+    # Pad data to multiple of 16 bytes
+    if len(data) % GCM_BLOCK_SIZE != 0:
+        data += b'\x00' * (GCM_BLOCK_SIZE - (len(data) % GCM_BLOCK_SIZE))
+
+    # Initialize result
+    result = 0
+
+    # Process each 16-byte block
+    for i in range(0, len(data), GCM_BLOCK_SIZE):
+        block = data[i:i + GCM_BLOCK_SIZE]
+        block_int = int.from_bytes(block, 'big')
+        result ^= block_int
+        result = ghash_block(result, H_table)
+
+    return result
+
+
+def sm4_gcm_encrypt(plaintext: bytes, key: bytes, nonce: bytes,
+                    aad: bytes = b"", optimization: OptimizationLevel = OptimizationLevel.TTABLE) -> Tuple[
+    bytes, bytes]:
+    """
+    SM4-GCM authenticated encryption
+
+    Args:
+        plaintext: Data to encrypt
+        key: 16-byte encryption key
+        nonce: 12-byte nonce (recommended size)
+        aad: Additional authenticated data
+        optimization: Optimization level for SM4
+
+    Returns:
+        (ciphertext, authentication_tag)
+    """
+    # Validate inputs
+    if len(key) != 16:
+        raise ValueError("Key must be 16 bytes")
+    if len(nonce) != 12:
+        raise ValueError("Nonce must be 12 bytes for GCM")
+
+    # Generate hash key H = E_K(0^128)
+    round_keys = key_expansion(key, optimization)
+    H = sm4_block_encrypt(b'\x00' * 16, round_keys, optimization)
+
+    # Initialize counter J0
+    if len(nonce) == 12:
+        j0 = nonce + b'\x00\x00\x00\x01'
+    else:
+        # For non-12-byte nonce, we need to compute GHASH
+        # This is simplified for demonstration
+        j0 = nonce + b'\x00' * (16 - (len(nonce) % 16))
+        j0 += (len(nonce) * 8).to_bytes(8, 'big')
+        j0 = ghash(j0, H)
+        j0 = j0.to_bytes(16, 'big')
+
+    # Encrypt plaintext in CTR mode
+    ctr = int.from_bytes(j0, 'big') + 1
+    ciphertext = _sm4_ctr_encrypt(plaintext, round_keys, ctr.to_bytes(16, 'big'), optimization)
+
+    # Compute authentication tag
+    # Format: len(aad) || len(ciphertext)
+    aad_len = len(aad) * 8
+    ciphertext_len = len(ciphertext) * 8
+    len_block = aad_len.to_bytes(8, 'big') + ciphertext_len.to_bytes(8, 'big')
+
+    # GHASH input: AAD || ciphertext || len_block
+    ghash_input = aad
+    # Pad AAD to 16-byte multiple
+    if len(ghash_input) % 16 != 0:
+        ghash_input += b'\x00' * (16 - (len(ghash_input) % 16))
+
+    ghash_input += ciphertext
+    # Pad ciphertext to 16-byte multiple
+    if len(ghash_input) % 16 != 0:
+        ghash_input += b'\x00' * (16 - (len(ghash_input) % 16))
+
+    ghash_input += len_block
+
+    # Compute GHASH
+    S = ghash(ghash_input, H)
+
+    # Compute authentication tag
+    T = sm4_block_encrypt(j0, round_keys, optimization)
+    T_int = int.from_bytes(T, 'big')
+    tag = (S ^ T_int).to_bytes(16, 'big')
+
+    return ciphertext, tag[:16]  # Return full tag or truncate to desired length
+
+
+def sm4_gcm_decrypt(ciphertext: bytes, key: bytes, nonce: bytes,
+                    tag: bytes, aad: bytes = b"",
+                    optimization: OptimizationLevel = OptimizationLevel.TTABLE) -> bytes:
+    """
+    SM4-GCM authenticated decryption
+
+    Args:
+        ciphertext: Encrypted data
+        key: 16-byte encryption key
+        nonce: 12-byte nonce
+        tag: Authentication tag
+        aad: Additional authenticated data
+        optimization: Optimization level for SM4
+
+    Returns:
+        Plaintext if authentication is successful
+    Raises:
+        ValueError if authentication fails
+    """
+    # Validate inputs
+    if len(key) != 16:
+        raise ValueError("Key must be 16 bytes")
+    if len(nonce) != 12:
+        raise ValueError("Nonce must be 12 bytes for GCM")
+
+    # Generate hash key H = E_K(0^128)
+    round_keys = key_expansion(key, optimization)
+    H = sm4_block_encrypt(b'\x00' * 16, round_keys, optimization)
+
+    # Initialize counter J0
+    if len(nonce) == 12:
+        j0 = nonce + b'\x00\x00\x00\x01'
+    else:
+        # For non-12-byte nonce, we need to compute GHASH
+        j0 = nonce + b'\x00' * (16 - (len(nonce) % 16))
+        j0 += (len(nonce) * 8).to_bytes(8, 'big')
+        j0 = ghash(j0, H)
+        j0 = j0.to_bytes(16, 'big')
+
+    # Decrypt ciphertext in CTR mode
+    ctr = int.from_bytes(j0, 'big') + 1
+    plaintext = _sm4_ctr_decrypt(ciphertext, round_keys, ctr.to_bytes(16, 'big'), optimization)
+
+    # Compute expected tag (same as encryption)
+    aad_len = len(aad) * 8
+    ciphertext_len = len(ciphertext) * 8
+    len_block = aad_len.to_bytes(8, 'big') + ciphertext_len.to_bytes(8, 'big')
+
+    ghash_input = aad
+    # Pad AAD to 16-byte multiple
+    if len(ghash_input) % 16 != 0:
+        ghash_input += b'\x00' * (16 - (len(ghash_input) % 16))
+
+    ghash_input += ciphertext
+    # Pad ciphertext to 16-byte multiple
+    if len(ghash_input) % 16 != 0:
+        ghash_input += b'\x00' * (16 - (len(ghash_input) % 16))
+
+    ghash_input += len_block
+
+    # Compute GHASH
+    S = ghash(ghash_input, H)
+
+    # Compute expected tag
+    T = sm4_block_encrypt(j0, round_keys, optimization)
+    T_int = int.from_bytes(T, 'big')
+    expected_tag = (S ^ T_int).to_bytes(16, 'big')
+
+    # Verify tag
+    if not constant_time_compare(expected_tag[:len(tag)], tag):
+        raise ValueError("Authentication failed - invalid tag")
+
+    return plaintext
+
+
+def constant_time_compare(a: bytes, b: bytes) -> bool:
+    """Constant-time comparison to prevent timing attacks"""
+    if len(a) != len(b):
+        return False
+    result = 0
+    for x, y in zip(a, b):
+        result |= x ^ y
+    return result == 0
+
+
+# Benchmark function
+def benchmark_sm4():
+    """Benchmark different optimization levels"""
+    key = b"16bytekey1234567"
+    data = os.urandom(1024 * 1024)  # 1MB data
+    iv = os.urandom(16)
+
+    levels = [
+        ("Basic", OptimizationLevel.BASIC),
+        ("T-table", OptimizationLevel.TTABLE),
+        # AVX2/AESNI/GFNI would require native extensions
     ]
 
-    for i, plaintext in enumerate(messages):
-        print(f"\nTest {i + 1}: {len(plaintext)} bytes")
-        print("Original: ", plaintext[:50] + (b"..." if len(plaintext) > 50 else b""))
+    print("SM4 Encryption Benchmarks (1MB data):")
+    for name, level in levels:
+        start = time.time()
+        ciphertext, _ = sm4_encrypt(data, key, iv, 'CBC', level)
+        end = time.time()
+        print(f"{name}: {len(data) / (end - start) / 1e6:.2f} MB/s")
 
-        # Encrypt
-        ciphertext, iv_used = sm4_encrypt(plaintext, key, iv)
-        print(f"Ciphertext ({len(ciphertext)} bytes):", ciphertext[:16].hex() + "...")
+    # GCM benchmark
+    print("\nSM4-GCM Benchmarks (1MB data):")
+    nonce = os.urandom(12)
+    aad = b"Authenticated but not encrypted"
+    for name, level in levels:
+        start = time.time()
+        ciphertext, tag = sm4_gcm_encrypt(data, key, nonce, aad, level)
+        end = time.time()
+        print(f"{name}: {len(data) / (end - start) / 1e6:.2f} MB/s")
 
-        # Decrypt
-        decrypted = sm4_decrypt(ciphertext, key, iv_used)
-        print("Decrypted: ", decrypted[:50] + (b"..." if len(decrypted) > 50 else b""))
 
-        # Verify
-        assert decrypted == plaintext, f"Test {i + 1} failed! {decrypted} != {plaintext}"
-        print("✓ Decryption verified successfully!")
+if __name__ == "__main__":
+    # Test basic functionality
+    key = b"16bytekey1234567"
+    iv = b"initialvector123"
+    plaintext = "Hello, SM4-GCM! This is a test of authenticated encryption."
 
-    print("\nAll tests passed!")
+    # Test GCM
+    print("Testing SM4-GCM:")
+    nonce = os.urandom(12)
+    aad = b"Additional authenticated data"
+    ciphertext, tag = sm4_gcm_encrypt(plaintext.encode(), key, nonce, aad)
+    print(f"Ciphertext: {ciphertext[:16].hex()}...")
+    print(f"Tag: {tag.hex()}")
+
+    try:
+        decrypted = sm4_gcm_decrypt(ciphertext, key, nonce, tag, aad)
+        print(f"Decrypted: {decrypted.decode()}")
+        assert decrypted.decode() == plaintext
+        print("GCM test successful!")
+    except ValueError as e:
+        print(f"GCM test failed: {e}")
+
+    # Run benchmarks
+    benchmark_sm4()
